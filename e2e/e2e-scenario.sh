@@ -1,8 +1,9 @@
 #!/bin/bash
-
 set -euxo pipefail
-
 source e2e-helper.sh
+
+# If a custom SIG_VERSION_ID was not provided via the command line or pipeline vars, default to a locked 1804Gen2 image for now
+: "${SIG_VERSION_ID:="/subscriptions/8ecadfc9-d1a3-4ea4-b844-0d9f87e4d7c8/resourceGroups/aksvhdtestbuildrg/providers/Microsoft.Compute/galleries/PackerSigGalleryEastUS/images/1804Gen2/versions/1.1666631350.18026"}"
 
 debug() {
     local retval
@@ -67,9 +68,15 @@ EOF
 cat $SCENARIO_NAME-vmss.json
 
 # Create a test VMSS with 1 instance 
-# TODO 3: Discuss about the --image version, probably go with aks-ubuntu-1804-gen2-2021-q2:latest
-#       However, how to incorporate chaning quarters?
 log "Creating VMSS"
+
+# Verify that the specified SIG_VERSION_ID is valid before attempting to use it, fail hard if it isn't
+id=$(az resource show --ids "$SIG_VERSION_ID" | jq -r .id)
+if [ -z "$id" ]; then
+    echo "unable to find SIG_VERSION_ID $SIG_VERSION_ID for use in e2e test"
+    exit 1
+fi
+
 vmssStartTime=$(date +%s)
 az vmss create -n ${VMSS_NAME} \
     -g $MC_RESOURCE_GROUP_NAME \
@@ -79,7 +86,7 @@ az vmss create -n ${VMSS_NAME} \
     --vm-sku $VM_SKU \
     --instance-count 1 \
     --assign-identity $msiResourceID \
-    --image "/subscriptions/8ecadfc9-d1a3-4ea4-b844-0d9f87e4d7c8/resourceGroups/aksvhdtestbuildrg/providers/Microsoft.Compute/galleries/PackerSigGalleryEastUS/images/1804Gen2/versions/1.1666631350.18026" \
+    --image $SIG_VERSION_ID \
     --upgrade-policy-mode Automatic \
     --ssh-key-values ~/.ssh/id_rsa.pub \
     -ojson
@@ -127,6 +134,7 @@ fi
 
 # Sleep to let the automatic upgrade of the VM finish
 waitForNodeStartTime=$(date +%s)
+nodeReady="false"
 for i in $(seq 1 10); do
     set +e
     kubectl get nodes | grep $vmInstanceName
@@ -137,6 +145,7 @@ for i in $(seq 1 10); do
         sleep 10
         continue
     fi
+    nodeReady="true"
     break;
 done
 waitForNodeEndTime=$(date +%s)
@@ -144,7 +153,7 @@ log "Waited $((waitForNodeEndTime-waitForNodeStartTime)) seconds for node to joi
 
 FAILED=0
 # Check if the node joined the cluster
-if [[ "$retval" -eq 0 ]]; then
+if [[ "${nodeReady}" == "true" ]]; then
     ok "Test succeeded, node joined the cluster"
     kubectl get nodes -o wide | grep $vmInstanceName
 else
@@ -157,6 +166,7 @@ tail -n 50 $SCENARIO_NAME-logs/cluster-provision.log || true
 
 if [ "$FAILED" == "1" ]; then
     echo "node join failed, dumping logs for debug"
+    kubectl describe node $vmInstanceName
     head -n 500 $SCENARIO_NAME-logs/kubelet.log || true
     cat $SCENARIO_NAME-logs/kubelet-status.txt || true
     exit 1
@@ -193,6 +203,7 @@ else
     err "Pod pending/not running"
     kubectl get pods -o wide | grep $podName
     kubectl describe pod $podName
+    kubectl describe node $vmInstanceName
     exit 1
 fi
 
